@@ -14,20 +14,6 @@ snapshot-paths: [snapshots]
 target-path: target
 clean-targets: [target, dbt_packages]
 
-groups:
-  - name: source
-    owner:
-      name: kiewit_team
-  - name: bronze
-    owner:
-      name: kiewit_team
-  - name: silver
-    owner:
-      name: kiewit_team
-  - name: gold
-    owner:
-      name: kiewit_teams
-
 seeds:
   demo_kiewit_dbt:
     customer:
