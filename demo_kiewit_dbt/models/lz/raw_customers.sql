@@ -14,3 +14,4 @@ select
     CONVERT_TIMEZONE('America/Los_Angeles', 'Asia/Kolkata', current_timestamp()) as _loaded_at,
     'customer.csv' as _source_file
 from {{ source('raw_customers', 'CUSTOMER') }}
+
