@@ -1,6 +1,7 @@
 import os
 import json
 import snowflake.connector
+import requests
 from dotenv import load_dotenv
 
 from dagster import (
@@ -85,6 +86,41 @@ def write_run_to_snowflake(
         if conn:
             conn.close()
 
+# 4b. FETCH dbt CLOUD RUN DETAILS
+def fetch_dbt_run_results(context):
+    """Fetch per-model results from the latest dbt Cloud run."""
+    import requests
+
+    host = os.getenv("DBT_CLOUD_HOST")
+    account_id = os.getenv("DBT_CLOUD_ACCOUNT_ID")
+    token = os.getenv("DBT_CLOUD_API_TOKEN")
+    job_id = os.getenv("DBT_JOB_ID")
+
+    headers = {"Authorization": f"Token {token}"}
+
+    # Get latest run for this job
+    runs_url = f"{host}/api/v2/accounts/{account_id}/runs/?job_definition_id={job_id}&order_by=-id&limit=1"
+    run_resp = requests.get(runs_url, headers=headers)
+    run_resp.raise_for_status()
+    latest_run = run_resp.json()["data"][0]
+    run_id = latest_run["id"]
+
+    # Fetch run results artifact
+    artifact_url = f"{host}/api/v2/accounts/{account_id}/runs/{run_id}/artifacts/run_results.json"
+    art_resp = requests.get(artifact_url, headers=headers)
+    art_resp.raise_for_status()
+    results = art_resp.json()["results"]
+
+    for r in results:
+        node = r["unique_id"]
+        status = r["status"]
+        exec_time = r["execution_time"]
+        rows = r.get("adapter_response", {}).get("rows_affected", "N/A")
+        context.log.info(f"  dbt: {node} | {status} | {rows} rows | {exec_time:.1f}s")
+
+    passed = sum(1 for r in results if r["status"] in ("success", "pass"))
+    failed = sum(1 for r in results if r["status"] == "error")
+    context.log.info(f"  dbt Summary: {passed} passed, {failed} failed out of {len(results)} total")
 
 # 5. SENSORS (auto-start)
 @run_status_sensor(
@@ -107,7 +143,18 @@ def log_failure_to_snowflake(context: RunStatusSensorContext):
         }
     write_run_to_snowflake(context, status="FAILURE", error_msg=error_data)
 
+@run_status_sensor(
+    run_status=DagsterRunStatus.SUCCESS,
+    default_status=DefaultSensorStatus.RUNNING,
+)
+def log_success_to_snowflake(context: RunStatusSensorContext):
+    write_run_to_snowflake(context, status="SUCCESS")
+    try:
+        fetch_dbt_run_results(context)
+    except Exception as e:
+        context.log.warning(f"Could not fetch dbt Cloud details: {e}")
 
+        
 # 6. JOB + SCHEDULE
 run_customer_pipeline = define_asset_job(
     name="trigger_customer_dbt_cloud_job",
