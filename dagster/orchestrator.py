@@ -88,7 +88,7 @@ def write_run_to_snowflake(
         if conn:
             conn.close()
 
-# 4b. FETCH dbt CLOUD RUN DETAILS + LOG TO SNOWFLAKE
+# 4b. FETCH dbt CLOUD RUN DETAILS + LOG TO SNOWFLAKE (available but not called by sensor)
 def fetch_dbt_run_results(context: RunStatusSensorContext):
     """Fetch per-model results from dbt Cloud and log to Snowflake."""
     host = os.getenv("DBT_CLOUD_HOST")
@@ -325,15 +325,13 @@ def log_success_to_snowflake(context: RunStatusSensorContext):
     """
     Fires after every successful Dagster run.
     1. Logs job status to DAGSTER_JOB_RUNS
-    2. Fetches per-model results from dbt Cloud -> DBT_MODEL_RUNS
-    3. Logs record counts for ALL tables across SOURCE/LZ/STAGING/DBO
+    2. Logs record counts for ALL tables across SOURCE/LZ/STAGING/DBO
+
+    NOTE: We do NOT call fetch_dbt_run_results here to keep the
+    sensor tick fast and avoid the 60s timeout. You can still call
+    fetch_dbt_run_results(context) from a separate job or script.
     """
     write_run_to_snowflake(context, status="SUCCESS")
-
-    try:
-        fetch_dbt_run_results(context)
-    except Exception as e:
-        context.log.warning(f"Could not fetch dbt Cloud details: {e}")
 
     try:
         log_record_counts(context)
