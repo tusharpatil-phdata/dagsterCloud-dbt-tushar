@@ -36,5 +36,3 @@ models:
       +materialized: table
       +tags: [dbo, gold]
       +group: gold
-      +post-hook:
-        - "{{ log_model_run() }}"
