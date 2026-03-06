@@ -88,7 +88,7 @@ def write_run_to_snowflake(
         if conn:
             conn.close()
 
-# 4b. FETCH dbt CLOUD RUN DETAILS + LOG TO SNOWFLAKE
+# 4b. FETCH dbt CLOUD RUN DETAILS + LOG TO SNOWFLAKE (available but not used in sensor)
 def fetch_dbt_run_results(context: RunStatusSensorContext):
     """Fetch per-model results from dbt Cloud and log to Snowflake."""
     host = os.getenv("DBT_CLOUD_HOST")
@@ -204,15 +204,15 @@ def trigger_dbt_retry(context: RunStatusSensorContext):
     context.log.info(f"  Retry job triggered! dbt Cloud Run ID: {run_id}")
     context.log.info("  Only failed models from the last run will be re-executed.")
 
-# 4d. LOG RECORD COUNTS TO SNOWFLAKE
+# 4d. LOG RECORD COUNTS TO SNOWFLAKE (ALL TABLES / LAYERS)
 def log_record_counts(context: RunStatusSensorContext):
     """
     After every successful run:
-    1. Query each layer table for current row count
-    2. Look up previous run's row count from LAYER_ROW_COUNTS table
-    3. Calculate rows added (current - previous)
-    4. Log to Dagster UI
-    5. Save to Snowflake LAYER_ROW_COUNTS table (full history)
+    - Query each table in each layer (SOURCE/LZ/STAGING/DBO)
+    - Look up previous row count from LAYER_ROW_COUNTS
+    - Calculate rows added
+    - Log to Dagster UI
+    - Insert into SANDBOX.METRICS.LAYER_ROW_COUNTS
     """
     conn = None
     try:
@@ -226,15 +226,46 @@ def log_record_counts(context: RunStatusSensorContext):
         cursor = conn.cursor()
         dagster_run_id = context.dagster_run.run_id
 
-        # Updated to singular model/table names
+        # Track all entities across all layers
         tables = [
-            ("SOURCE", "CUSTOMER"),        # Source layer
-            ("LZ", "RAW_CUSTOMER"),       # Bronze layer
-            ("STAGING", "STG_CUSTOMER"),  # Silver layer (VIEW)
-            ("DBO", "DIM_CUSTOMER"),      # Gold layer
+            # CUSTOMER
+            ("SOURCE", "CUSTOMER"),
+            ("LZ", "RAW_CUSTOMER"),
+            ("STAGING", "STG_CUSTOMER"),
+            ("DBO", "DIM_CUSTOMER"),
+
+            # ORDER_DETAIL
+            ("SOURCE", "ORDER_DETAIL"),
+            ("LZ", "RAW_ORDER_DETAIL"),
+            ("STAGING", "STG_ORDER_DETAIL"),
+            ("DBO", "FCT_ORDER_DETAIL"),
+
+            # ORDER_ITEM
+            ("SOURCE", "ORDER_ITEM"),
+            ("LZ", "RAW_ORDER_ITEM"),
+            ("STAGING", "STG_ORDER_ITEM"),
+            ("DBO", "FCT_ORDER_ITEM"),
+
+            # PRODUCT
+            ("SOURCE", "PRODUCT"),
+            ("LZ", "RAW_PRODUCT"),
+            ("STAGING", "STG_PRODUCT"),
+            ("DBO", "DIM_PRODUCT"),
+
+            # STORE
+            ("SOURCE", "STORE"),
+            ("LZ", "RAW_STORE"),
+            ("STAGING", "STG_STORE"),
+            ("DBO", "DIM_STORE"),
+
+            # SUPPLY
+            ("SOURCE", "SUPPLY"),
+            ("LZ", "RAW_SUPPLY"),
+            ("STAGING", "STG_SUPPLY"),
+            ("DBO", "DIM_SUPPLY"),
         ]
 
-        context.log.info("--- Record Counts ---")
+        context.log.info("--- Record Counts (all layers) ---")
         for schema, table in tables:
             # Step 1: Get current row count
             cursor.execute(f"SELECT COUNT(*) FROM {schema}.{table}")
@@ -300,19 +331,15 @@ def log_success_to_snowflake(context: RunStatusSensorContext):
     """
     Fires after every successful Dagster run.
     1. Logs job status to DAGSTER_JOB_RUNS
-    2. Fetches per-model results from dbt Cloud -> saves to DBT_MODEL_RUNS
-    3. Logs record counts for CUSTOMER across SOURCE/LZ/STAGING/DBO
+    2. Logs record counts for ALL tables across SOURCE/LZ/STAGING/DBO
+
+    NOTE: We intentionally do NOT call fetch_dbt_run_results here
+    to keep the sensor tick fast and avoid the 60s timeout.
     """
-    # 1) always log the run row (fast)
+    # 1) log the run row (fast)
     write_run_to_snowflake(context, status="SUCCESS")
 
-    # 2) per-model dbt results
-    try:
-        fetch_dbt_run_results(context)
-    except Exception as e:
-        context.log.warning(f"Could not fetch dbt Cloud details: {e}")
-
-    # 3) layer row counts
+    # 2) layer row counts
     try:
         log_record_counts(context)
     except Exception as e:
