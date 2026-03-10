@@ -525,9 +525,19 @@ def log_record_counts(context: RunStatusSensorContext):
         alerts = []
 
         context.log.info("=" * 60)
-        context.log.info("  RECORD COUNTS + THRESHOLD CHECKS")
+        context.log.info("  RECORD COUNTS (all layers) + SOURCE THRESHOLDS")
         context.log.info("=" * 60)
-        context.log.info(f"  Thresholds: Insert>{MAX_INSERT_PCT}% | Delete>{MAX_DELETE_PCT}% | MinRows>{MIN_ROWS}")
+
+        # Read per-table thresholds from config for SOURCE tables
+        cursor.execute("SELECT TABLE_NAME, MAX_INSERT_PCT, MAX_UPDATE_PCT, MAX_DELETE_PCT FROM METRICS.THRESHOLD_CONFIG")
+        threshold_rows = cursor.fetchall()
+        thresholds = {}
+        for t_name, m_ins, m_upd, m_del in threshold_rows:
+            thresholds[t_name] = {"insert": m_ins, "update": m_upd, "delete": m_del}
+
+        context.log.info("  SOURCE thresholds (from METRICS.THRESHOLD_CONFIG):")
+        for t_name, limits in thresholds.items():
+            context.log.info(f"    {t_name}: Insert>{limits['insert']}% | Update>{limits['update']}% | Delete>{limits['delete']}%")
         context.log.info("-" * 60)
 
         for schema, table in tables:
@@ -583,20 +593,24 @@ def log_record_counts(context: RunStatusSensorContext):
                 f"  {schema}.{table}: {rows_before:,} -> {rows_after:,} ({change_type})"
             )
 
-            # Threshold checks ONLY for SOURCE layer
+            # Threshold checks ONLY for SOURCE layer (using config table values)
             # LZ/STAGING/DBO are derived from SOURCE — they just reflect it
             if rows_before > 0 and schema == "SOURCE":
-                max_insert = int(rows_before * MAX_INSERT_PCT / 100) or 1
+                t = thresholds.get(table, {"insert": MAX_INSERT_PCT, "delete": MAX_DELETE_PCT})
+                t_insert = t.get("insert", MAX_INSERT_PCT)
+                t_delete = t.get("delete", MAX_DELETE_PCT)
+
+                max_insert = int(rows_before * t_insert / 100) or 1
                 if inserted > max_insert:
                     pct = round(inserted / rows_before * 100)
-                    msg = f"INSERT: {schema}.{table} | +{inserted:,} rows ({pct}% growth) exceeds {MAX_INSERT_PCT}% limit"
+                    msg = f"INSERT: SOURCE.{table} | +{inserted:,} rows ({pct}%) exceeds {t_insert}% limit"
                     context.log.warning(f"    >> {msg}")
                     alerts.append(msg)
 
-                max_delete = int(rows_before * MAX_DELETE_PCT / 100) or 1
+                max_delete = int(rows_before * t_delete / 100) or 1
                 if deleted > max_delete:
                     pct = round(deleted / rows_before * 100)
-                    msg = f"DELETE: {schema}.{table} | -{deleted:,} rows ({pct}% loss) exceeds {MAX_DELETE_PCT}% limit"
+                    msg = f"DELETE: SOURCE.{table} | -{deleted:,} rows ({pct}%) exceeds {t_delete}% limit"
                     context.log.error(f"    >> {msg}")
                     alerts.append(msg)
 
