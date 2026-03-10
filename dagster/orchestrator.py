@@ -1,9 +1,9 @@
 import os
 import json
 import random
+import uuid
 import snowflake.connector
 import requests
-import uuid
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -20,6 +20,7 @@ from dagster import (
     asset,
     AssetKey,
     Output,
+    RunRequest,
 )
 from dagster_dbt import (
     dbt_cloud_resource,
@@ -27,13 +28,16 @@ from dagster_dbt import (
 )
 
 
+# ══════════════════════════════════════════════════════════════
 # 1. LOAD SECRETS
+# ══════════════════════════════════════════════════════════════
 load_dotenv()
 
 
 # ══════════════════════════════════════════════════════════════
 # 2. SIMULATE DAILY INGESTION + THRESHOLD CHECK
 #    Runs BEFORE dbt — if thresholds breached, dbt won't run
+#    IDs use UUID format to match SOURCE table structure
 # ══════════════════════════════════════════════════════════════
 @asset(
     key=AssetKey("ingest_daily_data"),
@@ -45,8 +49,8 @@ def ingest_daily_data(context):
     """
     Step 1: Insert/Update/Delete rows in SOURCE (simulating daily ingestion)
     Step 2: Read Snowflake streams + thresholds from config table
-    Step 3: If breached → FAIL (dbt won't run)
-             If OK → PASS (dbt runs next)
+    Step 3: If breached -> FAIL (dbt won't run)
+             If OK -> PASS (dbt runs next via sensor)
     """
     conn = None
     try:
@@ -62,18 +66,16 @@ def ingest_daily_data(context):
 
         # ══════════════════════════════════════════════
         # STEP 1: INGEST DATA (simulate daily load)
-        # All IDs are UUIDs except PRODUCT (SKU) and SUPPLY (SUP-xxx)
+        # In production: Fivetran/Airbyte/API does this
         # ══════════════════════════════════════════════
         context.log.info("=" * 60)
         context.log.info("  STEP 1: DAILY DATA INGESTION")
         context.log.info("=" * 60)
 
-        import uuid
-
         first_names = ["John", "Jane", "Mike", "Sara", "Alex", "Emma", "Tom", "Lisa", "Ryan", "Kate"]
         last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Davis", "Miller", "Wilson"]
 
-        # Get existing IDs for references
+        # Get existing IDs for foreign key references
         cursor.execute("SELECT ID FROM SOURCE.CUSTOMER ORDER BY RANDOM() LIMIT 10")
         existing_customers = [r[0] for r in cursor.fetchall()]
 
@@ -127,7 +129,7 @@ def ingest_daily_data(context):
         cursor.execute("DELETE FROM SOURCE.ORDER_DETAIL WHERE ID IN (SELECT ID FROM SOURCE.ORDER_DETAIL ORDER BY RANDOM() LIMIT 2)")
         context.log.info(f"  ORDER_DETAIL: +{new_orders} inserts | {upd_orders} updates | -2 deletes")
 
-        # ── ORDER_ITEM: insert + delete ──
+        # ── ORDER_ITEM: insert + delete (items don't get updated) ──
         new_items = 0
         for oid in new_order_ids:
             for j in range(random.randint(2, 3)):
@@ -173,15 +175,15 @@ def ingest_daily_data(context):
 
         # ══════════════════════════════════════════════
         # STEP 2: READ STREAMS + CHECK THRESHOLDS
-        # Thresholds are stored in METRICS.THRESHOLD_CONFIG
-        # Streams are combined in SOURCE.ALL_STREAMS_SUMMARY
+        # Thresholds stored in METRICS.THRESHOLD_CONFIG (Snowflake table)
+        # Streams combined in SOURCE.ALL_STREAMS_SUMMARY (one query)
         # ══════════════════════════════════════════════
         context.log.info("")
         context.log.info("=" * 60)
         context.log.info("  STEP 2: THRESHOLD CHECK (before dbt runs)")
         context.log.info("=" * 60)
 
-        # Read per-table thresholds from config table (no hardcoded values)
+        # Read per-table thresholds from config table
         cursor.execute("SELECT TABLE_NAME, MAX_INSERT_PCT, MAX_UPDATE_PCT, MAX_DELETE_PCT FROM METRICS.THRESHOLD_CONFIG")
         threshold_rows = cursor.fetchall()
         thresholds = {}
@@ -463,7 +465,7 @@ def trigger_dbt_retry(context: RunStatusSensorContext):
 
 # ══════════════════════════════════════════════════════════════
 # 5d. LOG RECORD COUNTS TO SNOWFLAKE (ALL 24 TABLES)
-#     After every successful run, counts rows in all layers
+#     After every successful dbt run, counts rows in all layers
 #     Compares with previous run (no hardcoded values)
 #     Checks percentage-based thresholds
 #     Saves to METRICS.LAYER_ROW_COUNTS
@@ -533,7 +535,7 @@ def log_record_counts(context: RunStatusSensorContext):
             cursor.execute(f"SELECT COUNT(*) FROM {schema}.{table}")
             rows_after = cursor.fetchone()[0]
 
-            # Previous run row count (from METRICS.LAYER_ROW_COUNTS)
+            # Previous run row count
             cursor.execute(
                 """
                 SELECT ROWS_AFTER FROM METRICS.LAYER_ROW_COUNTS
@@ -581,7 +583,7 @@ def log_record_counts(context: RunStatusSensorContext):
                 f"  {schema}.{table}: {rows_before:,} -> {rows_after:,} ({change_type})"
             )
 
-            # Threshold checks (based on previous run, not hardcoded)
+            # Threshold checks (based on previous run)
             if rows_before > 0:
                 max_insert = int(rows_before * MAX_INSERT_PCT / 100) or 1
                 if inserted > max_insert:
@@ -624,9 +626,10 @@ def log_record_counts(context: RunStatusSensorContext):
 
 
 # ══════════════════════════════════════════════════════════════
-# 6. SENSORS (auto-start)
-#    Success: logs to DAGSTER_JOB_RUNS + row counts for all 24 tables
-#    Failure: logs to DAGSTER_JOB_RUNS + triggers retry job
+# 6. SENSORS
+#    - log_success_to_snowflake: logs dbt job success + row counts
+#    - log_failure_to_snowflake: logs failure + triggers retry
+#    - trigger_dbt_after_ingestion: chains ingestion -> dbt
 # ══════════════════════════════════════════════════════════════
 @run_status_sensor(
     run_status=DagsterRunStatus.SUCCESS,
@@ -634,10 +637,8 @@ def log_record_counts(context: RunStatusSensorContext):
 )
 def log_success_to_snowflake(context: RunStatusSensorContext):
     """
-    Fires after every successful Dagster run.
-    1. Logs job status to METRICS.DAGSTER_JOB_RUNS
-    2. Logs record counts for ALL 24 tables across SOURCE/LZ/STAGING/DBO
-    NOTE: fetch_dbt_run_results not called here to avoid sensor timeout.
+    Fires after every successful Dagster run (both ingestion and dbt).
+    Logs job status + record counts for all 24 tables.
     """
     write_run_to_snowflake(context, status="SUCCESS")
     try:
@@ -653,8 +654,7 @@ def log_success_to_snowflake(context: RunStatusSensorContext):
 def log_failure_to_snowflake(context: RunStatusSensorContext):
     """
     Fires after every failed Dagster run.
-    1. Logs job status to METRICS.DAGSTER_JOB_RUNS with error message
-    2. Triggers dbt retry job (only reruns failed models)
+    Logs failure + triggers dbt retry job.
     """
     error_data = None
     if context.failure_event and context.failure_event.step_failure_data:
@@ -669,32 +669,71 @@ def log_failure_to_snowflake(context: RunStatusSensorContext):
 
 
 # ══════════════════════════════════════════════════════════════
-# 7. JOB + SCHEDULE
-#    Job runs all assets (ingestion + dbt models)
-#    Schedule: daily at 6 AM UTC
+# 7. JOBS
+#    ingestion_job: runs ONLY ingest_daily_data (ingestion + thresholds)
+#    dbt_job: runs ONLY dbt Cloud models
+#    This separation ensures dbt only runs if ingestion passes
 # ══════════════════════════════════════════════════════════════
-run_customer_pipeline = define_asset_job(
-    name="trigger_customer_dbt_cloud_job",
-    selection=AssetSelection.all(),
+
+# Job that runs ONLY ingestion + threshold check
+ingestion_job = define_asset_job(
+    name="run_ingestion_and_threshold_check",
+    selection=AssetSelection.keys(AssetKey("ingest_daily_data")),
     executor_def=in_process_executor,
 )
 
+# Job that runs ONLY dbt Cloud models
+dbt_job = define_asset_job(
+    name="trigger_dbt_cloud_job",
+    selection=AssetSelection.all() - AssetSelection.keys(AssetKey("ingest_daily_data")),
+    executor_def=in_process_executor,
+)
+
+
+# ══════════════════════════════════════════════════════════════
+# 8. SENSOR: Run dbt ONLY after ingestion succeeds
+#    Watches ingestion_job — when it succeeds, triggers dbt_job
+#    If ingestion fails (threshold breach), dbt never runs
+# ══════════════════════════════════════════════════════════════
+@run_status_sensor(
+    run_status=DagsterRunStatus.SUCCESS,
+    default_status=DefaultSensorStatus.RUNNING,
+    monitored_jobs=[ingestion_job],
+    request_job=dbt_job,
+    name="trigger_dbt_after_ingestion",
+)
+def trigger_dbt_after_ingestion(context: RunStatusSensorContext):
+    """
+    Only triggers dbt Cloud job AFTER ingestion + threshold check passes.
+    If ingestion fails (threshold breached), this sensor never fires,
+    and dbt never runs — bad data never reaches Gold layer.
+    """
+    context.log.info("  Ingestion succeeded + thresholds passed -> triggering dbt Cloud job")
+    return RunRequest()
+
+
+# ══════════════════════════════════════════════════════════════
+# 9. SCHEDULE
+#    Daily at 6 AM UTC — triggers ingestion_job first
+#    If ingestion passes, sensor triggers dbt_job automatically
+# ══════════════════════════════════════════════════════════════
 daily_schedule = ScheduleDefinition(
-    job=run_customer_pipeline,
+    job=ingestion_job,
     cron_schedule="0 6 * * *",
     execution_timezone="UTC",
 )
 
 
 # ══════════════════════════════════════════════════════════════
-# 8. REGISTER EVERYTHING
-#    ingest_daily_data runs FIRST (ingestion + threshold gate)
-#    customer_dbt_assets runs NEXT (dbt Cloud job)
-#    sensors fire AFTER (logging + retry)
+# 10. REGISTER EVERYTHING
 # ══════════════════════════════════════════════════════════════
 defs = Definitions(
     assets=[ingest_daily_data, customer_dbt_assets],
-    jobs=[run_customer_pipeline],
+    jobs=[ingestion_job, dbt_job],
     schedules=[daily_schedule],
-    sensors=[log_success_to_snowflake, log_failure_to_snowflake],
+    sensors=[
+        log_success_to_snowflake,
+        log_failure_to_snowflake,
+        trigger_dbt_after_ingestion,
+    ],
 )
