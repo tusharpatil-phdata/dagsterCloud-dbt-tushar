@@ -717,7 +717,7 @@ def log_record_counts(context: RunStatusSensorContext):
     run_status=DagsterRunStatus.SUCCESS,
     default_status=DefaultSensorStatus.RUNNING,
 )
-ddef log_success_to_snowflake(context: RunStatusSensorContext):
+def log_success_to_snowflake(context: RunStatusSensorContext):
     """
     Fires after every successful Dagster run.
     - After ingestion: logs job status + SOURCE row counts only
