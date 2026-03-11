@@ -34,22 +34,30 @@ from dagster_dbt import (
 load_dotenv()
 
 # ══════════════════════════════════════════════════════════════
-# 2. INGEST FROM ADLS + THRESHOLD CHECK
-#    Runs BEFORE dbt — if thresholds breached, dbt won't run
+# 2. INGEST FROM ADLS → STAGE → VALIDATE → MERGE INTO SOURCE
+#    Runs BEFORE dbt — if validation/thresholds fail, dbt won't run
 # ══════════════════════════════════════════════════════════════
 @asset(
     key=AssetKey("ingest_daily_data"),
     group_name="ingestion",
     compute_kind="snowflake",
-    description="Ingest data from ADLS into SOURCE + check thresholds before dbt runs",
+    description="Ingest data from ADLS into STAGE, validate, then MERGE into SOURCE before dbt runs",
     retry_policy=RetryPolicy(max_retries=3, delay=30),
 )
 def ingest_daily_data(context):
     """
-    Step 1: Load data from ADLS Gen2 into SOURCE tables (TRUNCATE + COPY)
-    Step 2: Read Snowflake streams + thresholds from config table
-    Step 3: If breached -> FAIL (dbt won't run)
-             If OK -> PASS (dbt runs next via sensor)
+    Per run:
+
+    1) COPY CSVs from ADLS into *_STAGE tables
+       (CUSTOMER_STAGE, ORDER_DETAIL_STAGE, etc.)
+    2) Validate *_STAGE:
+         - Non-empty
+         - Key columns not NULL
+    3) Compare STAGE row counts vs previous SOURCE row counts
+       using METRICS.THRESHOLD_CONFIG (MAX_INSERT_PCT, MAX_DELETE_PCT)
+    4) If all checks pass -> MERGE *_STAGE into SOURCE.*
+       If any check fails -> raise Exception (SOURCE stays last good),
+       dbt job will NOT run.
     """
     conn = None
     try:
@@ -64,173 +72,348 @@ def ingest_daily_data(context):
         cursor = conn.cursor()
 
         # ══════════════════════════════════════════════
-        # STEP 1: INGEST FROM ADLS (TRUNCATE + COPY)
-        # ADLS stage + file format are already configured:
-        #   - STAGE  : SOURCE.ADLS_RAW_STAGE
-        #   - FORMAT : SOURCE.CSV_FORMAT
-        # This step ensures SOURCE tables match latest CSVs in ADLS.
+        # STEP 1: COPY FROM ADLS INTO *_STAGE
         # ══════════════════════════════════════════════
         context.log.info("=" * 60)
-        context.log.info("  STEP 1: LOAD FROM ADLS INTO SOURCE")
+        context.log.info("  STEP 1: COPY FROM ADLS INTO *_STAGE")
         context.log.info("=" * 60)
 
-        # 1a) Truncate all SOURCE tables
-        truncate_cmds = [
-            "TRUNCATE TABLE CUSTOMER",
-            "TRUNCATE TABLE ORDER_DETAIL",
-            "TRUNCATE TABLE ORDER_ITEM",
-            "TRUNCATE TABLE PRODUCT",
-            "TRUNCATE TABLE STORE",
-            "TRUNCATE TABLE SUPPLY",
+        source_tables = [
+            "CUSTOMER",
+            "ORDER_DETAIL",
+            "ORDER_ITEM",
+            "PRODUCT",
+            "STORE",
+            "SUPPLY",
         ]
-        for sql in truncate_cmds:
+
+        # 1a) Capture previous SOURCE row counts for thresholds
+        prev_counts = {}
+        for table in source_tables:
+            cursor.execute(f"SELECT COUNT(*) FROM SOURCE.{table}")
+            prev_counts[table] = cursor.fetchone()[0] or 0
+            context.log.info(f"  Previous SOURCE.{table}: {prev_counts[table]:,} rows")
+
+        # 1b) Truncate STAGE tables
+        truncate_stage_cmds = [
+            "TRUNCATE TABLE CUSTOMER_STAGE",
+            "TRUNCATE TABLE ORDER_DETAIL_STAGE",
+            "TRUNCATE TABLE ORDER_ITEM_STAGE",
+            "TRUNCATE TABLE PRODUCT_STAGE",
+            "TRUNCATE TABLE STORE_STAGE",
+            "TRUNCATE TABLE SUPPLY_STAGE",
+        ]
+        for sql in truncate_stage_cmds:
             context.log.info(f"  Running: {sql}")
             cursor.execute(sql)
 
-        # 1b) COPY from ADLS stage into each SOURCE table
-        copy_cmds = [
+        # 1c) COPY from ADLS external stage into STAGE tables
+        copy_stage_cmds = [
             """
-            COPY INTO CUSTOMER
+            COPY INTO CUSTOMER_STAGE
             FROM @SOURCE.ADLS_RAW_STAGE/customer.csv
             FILE_FORMAT = (FORMAT_NAME = SOURCE.CSV_FORMAT)
             """,
             """
-            COPY INTO ORDER_DETAIL
+            COPY INTO ORDER_DETAIL_STAGE
             FROM @SOURCE.ADLS_RAW_STAGE/order_detail.csv
             FILE_FORMAT = (FORMAT_NAME = SOURCE.CSV_FORMAT)
             """,
             """
-            COPY INTO ORDER_ITEM
+            COPY INTO ORDER_ITEM_STAGE
             FROM @SOURCE.ADLS_RAW_STAGE/order_item.csv
             FILE_FORMAT = (FORMAT_NAME = SOURCE.CSV_FORMAT)
             """,
             """
-            COPY INTO PRODUCT
+            COPY INTO PRODUCT_STAGE
             FROM @SOURCE.ADLS_RAW_STAGE/product.csv
             FILE_FORMAT = (FORMAT_NAME = SOURCE.CSV_FORMAT)
             """,
             """
-            COPY INTO STORE
+            COPY INTO STORE_STAGE
             FROM @SOURCE.ADLS_RAW_STAGE/store.csv
             FILE_FORMAT = (FORMAT_NAME = SOURCE.CSV_FORMAT)
             """,
             """
-            COPY INTO SUPPLY
+            COPY INTO SUPPLY_STAGE
             FROM @SOURCE.ADLS_RAW_STAGE/supply.csv
             FILE_FORMAT = (FORMAT_NAME = SOURCE.CSV_FORMAT)
             """,
         ]
-        for sql in copy_cmds:
+        for sql in copy_stage_cmds:
             clean_sql = sql.strip()
-            context.log.info(f"  Running COPY:\n{clean_sql}")
+            context.log.info(f"  Running COPY INTO STAGE:\n{clean_sql}")
             cursor.execute(clean_sql)
 
         conn.commit()
-        context.log.info("  SOURCE tables successfully loaded from ADLS")
+        context.log.info("  All *_STAGE tables loaded from ADLS")
 
         # ══════════════════════════════════════════════
-        # STEP 2: READ STREAMS + CHECK THRESHOLDS
-        # Thresholds stored in METRICS.THRESHOLD_CONFIG (Snowflake table)
-        # Streams combined in SOURCE.ALL_STREAMS_SUMMARY (one query)
+        # STEP 2: BASIC VALIDATION ON *_STAGE
         # ══════════════════════════════════════════════
         context.log.info("")
         context.log.info("=" * 60)
-        context.log.info("  STEP 2: THRESHOLD CHECK (before dbt runs)")
+        context.log.info("  STEP 2: VALIDATE *_STAGE TABLES")
         context.log.info("=" * 60)
 
-        # Read per-table thresholds from config table
+        validation_errors = []
+
+        # Define key columns to check per STAGE table
+        stage_tables = {
+            "CUSTOMER_STAGE":      {"key_cols": ["ID", "NAME"]},
+            "ORDER_DETAIL_STAGE":  {"key_cols": ["ID", "CUSTOMER", "STORE_ID"]},
+            "ORDER_ITEM_STAGE":    {"key_cols": ["ID", "ORDER_ID", "SKU"]},
+            "PRODUCT_STAGE":       {"key_cols": ["SKU", "NAME"]},
+            "STORE_STAGE":         {"key_cols": ["ID", "NAME"]},
+            "SUPPLY_STAGE":        {"key_cols": ["ID", "SKU", "NAME"]},
+        }
+
+        stage_counts = {}
+        # 2a) Non-empty checks
+        for stage_table, meta in stage_tables.items():
+            cursor.execute(f"SELECT COUNT(*) FROM SOURCE.{stage_table}")
+            c = cursor.fetchone()[0] or 0
+            stage_counts[stage_table] = c
+            context.log.info(f"  {stage_table}: {c:,} rows")
+            if c == 0:
+                validation_errors.append(f"{stage_table} is empty after COPY from ADLS")
+
+        # 2b) NOT NULL checks on key columns
+        for stage_table, meta in stage_tables.items():
+            for col in meta["key_cols"]:
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM SOURCE.{stage_table} WHERE {col} IS NULL"
+                )
+                nulls = cursor.fetchone()[0] or 0
+                if nulls > 0:
+                    msg = f"{stage_table}.{col} has {nulls} NULL values"
+                    context.log.error(f"    >> {msg}")
+                    validation_errors.append(msg)
+
+        if validation_errors:
+            context.log.error("-" * 60)
+            context.log.error("  STAGE VALIDATION FAILED, will NOT MERGE into SOURCE")
+            for err in validation_errors:
+                context.log.error(f"    - {err}")
+            context.log.error("=" * 60)
+            raise Exception(
+                "Stage validation failed. SOURCE tables kept at last good version. "
+                f"Issues: {'; '.join(validation_errors)}"
+            )
+
+        # ══════════════════════════════════════════════
+        # STEP 3: THRESHOLD CHECKS (STAGE vs previous SOURCE)
+        #       Using METRICS.THRESHOLD_CONFIG
+        # ══════════════════════════════════════════════
+        context.log.info("")
+        context.log.info("=" * 60)
+        context.log.info("  STEP 3: THRESHOLD CHECKS (row-count deltas)")
+        context.log.info("=" * 60)
+
+        # Load thresholds from config
         cursor.execute(
             "SELECT TABLE_NAME, MAX_INSERT_PCT, MAX_UPDATE_PCT, MAX_DELETE_PCT "
             "FROM METRICS.THRESHOLD_CONFIG"
         )
         threshold_rows = cursor.fetchall()
         thresholds = {}
-        for t_name, m_ins, m_upd, m_del in threshold_rows:
-            thresholds[t_name] = {"insert": m_ins, "update": m_upd, "delete": m_del}
+        for t_name, m_ins, _m_upd, m_del in threshold_rows:
+            thresholds[t_name] = {"insert": m_ins, "delete": m_del}
 
-        context.log.info("  Thresholds loaded from METRICS.THRESHOLD_CONFIG")
-        context.log.info("-" * 60)
+        threshold_alerts = []
 
-        alerts = []
+        stage_to_source = {
+            "CUSTOMER_STAGE":     "CUSTOMER",
+            "ORDER_DETAIL_STAGE": "ORDER_DETAIL",
+            "ORDER_ITEM_STAGE":   "ORDER_ITEM",
+            "PRODUCT_STAGE":      "PRODUCT",
+            "STORE_STAGE":        "STORE",
+            "SUPPLY_STAGE":       "SUPPLY",
+        }
 
-        # One query to read all stream changes
-        cursor.execute(
-            "SELECT TABLE_NAME, INSERTS, UPDATES, DELETES FROM SOURCE.ALL_STREAMS_SUMMARY"
-        )
-        stream_rows = cursor.fetchall()
+        for stage_table, src_table in stage_to_source.items():
+            old_count = prev_counts[src_table]
+            new_count = stage_counts[stage_table]
 
-        for table_name, inserts, updates, deletes in stream_rows:
-            inserts = int(inserts or 0)
-            updates = int(updates or 0)
-            deletes = int(deletes or 0)
-            total = inserts + updates + deletes
-
-            if total == 0:
-                context.log.info(f"  SOURCE.{table_name}: No changes")
+            # First load: no baseline
+            if old_count == 0:
+                context.log.info(
+                    f"  {src_table}: prev=0, treating as initial load (no threshold check)"
+                )
                 continue
 
-            # Get current row count for percentage calculation
-            cursor.execute(f"SELECT COUNT(*) FROM SOURCE.{table_name}")
-            current_rows = cursor.fetchone()[0] or 1
-
-            # Get thresholds for this table (default 50/30/10 if not in config)
-            t = thresholds.get(table_name, {"insert": 50, "update": 30, "delete": 10})
-
-            ins_pct = round(inserts / current_rows * 100, 1)
-            upd_pct = round(updates / current_rows * 100, 1)
-            del_pct = round(deletes / current_rows * 100, 1)
-
-            context.log.info(
-                f"  SOURCE.{table_name}: {inserts:,} inserts ({ins_pct}%) | "
-                f"{updates:,} updates ({upd_pct}%) | "
-                f"{deletes:,} deletes ({del_pct}%) "
-                f"[limits: {t['insert']}%/{t['update']}%/{t['delete']}%]"
-            )
-
-            # Check insert threshold
-            if ins_pct > t["insert"]:
-                msg = (
-                    f"INSERT BREACH: SOURCE.{table_name} | {inserts:,} rows "
-                    f"({ins_pct}%) exceeds {t['insert']}% limit"
+            if new_count == old_count:
+                context.log.info(
+                    f"  {src_table}: {old_count:,} -> {new_count:,} (no change)"
                 )
-                context.log.error(f"    >> {msg}")
-                alerts.append(msg)
+                continue
 
-            # Check update threshold
-            if upd_pct > t["update"]:
-                msg = (
-                    f"UPDATE BREACH: SOURCE.{table_name} | {updates:,} rows "
-                    f"({upd_pct}%) exceeds {t['update']}% limit"
+            if new_count > old_count:
+                delta = new_count - old_count
+                pct = round(delta / old_count * 100, 1)
+                limit = thresholds.get(src_table, {}).get("insert", 100)
+                context.log.info(
+                    f"  {src_table}: {old_count:,} -> {new_count:,} "
+                    f"(+{delta:,}, {pct}%) [insert limit {limit}%]"
                 )
-                context.log.error(f"    >> {msg}")
-                alerts.append(msg)
-
-            # Check delete threshold
-            if del_pct > t["delete"]:
-                msg = (
-                    f"DELETE BREACH: SOURCE.{table_name} | {deletes:,} rows "
-                    f"({del_pct}%) exceeds {t['delete']}% limit"
+                if pct > limit:
+                    msg = (
+                        f"INSERT BREACH: SOURCE.{src_table} | +{delta:,} rows "
+                        f"({pct}%) exceeds {limit}% limit"
+                    )
+                    context.log.error(f"    >> {msg}")
+                    threshold_alerts.append(msg)
+            else:
+                delta = old_count - new_count
+                pct = round(delta / old_count * 100, 1)
+                limit = thresholds.get(src_table, {}).get("delete", 100)
+                context.log.info(
+                    f"  {src_table}: {old_count:,} -> {new_count:,} "
+                    f"(-{delta:,}, {pct}%) [delete limit {limit}%]"
                 )
-                context.log.error(f"    >> {msg}")
-                alerts.append(msg)
+                if pct > limit:
+                    msg = (
+                        f"DELETE BREACH: SOURCE.{src_table} | -{delta:,} rows "
+                        f"({pct}%) exceeds {limit}% limit"
+                    )
+                    context.log.error(f"    >> {msg}")
+                    threshold_alerts.append(msg)
 
-        # ══════════════════════════════════════════════
-        # STEP 3: PASS OR FAIL — gates the dbt run
-        # ══════════════════════════════════════════════
-        context.log.info("-" * 60)
-        if alerts:
-            context.log.error(f"  {len(alerts)} THRESHOLD BREACH(ES) — dbt will NOT run:")
-            for a in alerts:
+        if threshold_alerts:
+            context.log.error("-" * 60)
+            context.log.error("  THRESHOLD CHECK FAILED, will NOT MERGE into SOURCE")
+            for a in threshold_alerts:
                 context.log.error(f"    - {a}")
-            context.log.info("=" * 60)
+            context.log.error("=" * 60)
             raise Exception(
-                f"Threshold breached! {len(alerts)} alert(s). "
-                f"Fix SOURCE data before running dbt. Details: {'; '.join(alerts)}"
+                "Row-count thresholds breached. SOURCE tables kept at last good version. "
+                f"Details: {'; '.join(threshold_alerts)}"
             )
-        else:
-            context.log.info("  ALL THRESHOLDS PASSED — dbt will run next")
-            context.log.info("=" * 60)
 
+        # ══════════════════════════════════════════════
+        # STEP 4: MERGE *_STAGE INTO SOURCE.*
+        # ══════════════════════════════════════════════
+        context.log.info("")
+        context.log.info("=" * 60)
+        context.log.info("  STEP 4: MERGE *_STAGE INTO SOURCE.*")
+        context.log.info("=" * 60)
+
+        merge_cmds = [
+            # CUSTOMER
+            """
+            MERGE INTO CUSTOMER AS tgt
+            USING CUSTOMER_STAGE AS src
+              ON tgt.ID = src.ID
+            WHEN MATCHED THEN
+              UPDATE SET
+                tgt.NAME = src.NAME
+            WHEN NOT MATCHED THEN
+              INSERT (ID, NAME)
+              VALUES (src.ID, src.NAME)
+            WHEN NOT MATCHED BY SOURCE THEN
+              DELETE
+            """,
+
+            # ORDER_DETAIL
+            """
+            MERGE INTO ORDER_DETAIL AS tgt
+            USING ORDER_DETAIL_STAGE AS src
+              ON tgt.ID = src.ID
+            WHEN MATCHED THEN
+              UPDATE SET
+                tgt.CUSTOMER    = src.CUSTOMER,
+                tgt.ORDERED_AT  = src.ORDERED_AT,
+                tgt.STORE_ID    = src.STORE_ID,
+                tgt.SUBTOTAL    = src.SUBTOTAL,
+                tgt.TAX_PAID    = src.TAX_PAID,
+                tgt.ORDER_TOTAL = src.ORDER_TOTAL
+            WHEN NOT MATCHED THEN
+              INSERT (ID, CUSTOMER, ORDERED_AT, STORE_ID, SUBTOTAL, TAX_PAID, ORDER_TOTAL)
+              VALUES (src.ID, src.CUSTOMER, src.ORDERED_AT, src.STORE_ID, src.SUBTOTAL, src.TAX_PAID, src.ORDER_TOTAL)
+            WHEN NOT MATCHED BY SOURCE THEN
+              DELETE
+            """,
+
+            # ORDER_ITEM
+            """
+            MERGE INTO ORDER_ITEM AS tgt
+            USING ORDER_ITEM_STAGE AS src
+              ON tgt.ID = src.ID
+            WHEN MATCHED THEN
+              UPDATE SET
+                tgt.ORDER_ID = src.ORDER_ID,
+                tgt.SKU      = src.SKU
+            WHEN NOT MATCHED THEN
+              INSERT (ID, ORDER_ID, SKU)
+              VALUES (src.ID, src.ORDER_ID, src.SKU)
+            WHEN NOT MATCHED BY SOURCE THEN
+              DELETE
+            """,
+
+            # PRODUCT
+            """
+            MERGE INTO PRODUCT AS tgt
+            USING PRODUCT_STAGE AS src
+              ON tgt.SKU = src.SKU
+            WHEN MATCHED THEN
+              UPDATE SET
+                tgt.NAME        = src.NAME,
+                tgt.TYPE        = src.TYPE,
+                tgt.PRICE       = src.PRICE,
+                tgt.DESCRIPTION = src.DESCRIPTION
+            WHEN NOT MATCHED THEN
+              INSERT (SKU, NAME, TYPE, PRICE, DESCRIPTION)
+              VALUES (src.SKU, src.NAME, src.TYPE, src.PRICE, src.DESCRIPTION)
+            WHEN NOT MATCHED BY SOURCE THEN
+              DELETE
+            """,
+
+            # STORE
+            """
+            MERGE INTO STORE AS tgt
+            USING STORE_STAGE AS src
+              ON tgt.ID = src.ID
+            WHEN MATCHED THEN
+              UPDATE SET
+                tgt.NAME      = src.NAME,
+                tgt.OPENED_AT = src.OPENED_AT,
+                tgt.TAX_RATE  = src.TAX_RATE
+            WHEN NOT MATCHED THEN
+              INSERT (ID, NAME, OPENED_AT, TAX_RATE)
+              VALUES (src.ID, src.NAME, src.OPENED_AT, src.TAX_RATE)
+            WHEN NOT MATCHED BY SOURCE THEN
+              DELETE
+            """,
+
+            # SUPPLY (ID + SKU as key)
+            """
+            MERGE INTO SUPPLY AS tgt
+            USING SUPPLY_STAGE AS src
+              ON tgt.ID  = src.ID
+             AND tgt.SKU = src.SKU
+            WHEN MATCHED THEN
+              UPDATE SET
+                tgt.NAME       = src.NAME,
+                tgt.COST       = src.COST,
+                tgt.PERISHABLE = src.PERISHABLE
+            WHEN NOT MATCHED THEN
+              INSERT (ID, NAME, COST, PERISHABLE, SKU)
+              VALUES (src.ID, src.NAME, src.COST, src.PERISHABLE, src.SKU)
+            WHEN NOT MATCHED BY SOURCE THEN
+              DELETE
+            """,
+        ]
+
+        for sql in merge_cmds:
+            clean_sql = sql.strip()
+            context.log.info(f"  Running MERGE:\n{clean_sql}")
+            cursor.execute(clean_sql)
+
+        conn.commit()
+        context.log.info("  MERGE completed – SOURCE updated from validated STAGE data")
+
+        # If we reach here, ingestion + validation + thresholds all passed.
+        # dbt job will be triggered by trigger_dbt_after_ingestion sensor.
         return Output(None)
 
     except snowflake.connector.errors.ProgrammingError as e:
@@ -732,7 +915,7 @@ def log_failure_to_snowflake(context: RunStatusSensorContext):
 # 7. JOBS
 # ══════════════════════════════════════════════════════════════
 
-# Job that runs ONLY ingestion + threshold check
+# Job that runs ONLY ingestion + validation + thresholds
 ingestion_job = define_asset_job(
     name="run_ingestion_and_threshold_check",
     selection=AssetSelection.keys(AssetKey("ingest_daily_data")),
@@ -758,8 +941,8 @@ dbt_job = define_asset_job(
 )
 def trigger_dbt_after_ingestion(context: RunStatusSensorContext):
     """
-    Only triggers dbt Cloud job AFTER ingestion + threshold check passes.
-    If ingestion fails (threshold breached), this sensor never fires,
+    Only triggers dbt Cloud job AFTER ingestion + validation + thresholds pass.
+    If ingestion fails, this sensor never fires,
     and dbt never runs — bad data never reaches Gold layer.
     """
     context.log.info("  Ingestion succeeded + thresholds passed -> triggering dbt Cloud job")
