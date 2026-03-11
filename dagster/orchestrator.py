@@ -36,6 +36,10 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════
 # 2. INGEST FROM ADLS → STAGE → VALIDATE → MERGE INTO SOURCE
 #    Runs BEFORE dbt — if validation/thresholds fail, dbt won't run
+#    Assumes these exist in Snowflake:
+#      - STAGE  : SOURCE.ADLS_RAW_STAGE
+#      - FORMAT : SOURCE.CSV_FORMAT
+#      - STAGE TABLES: CUSTOMER_STAGE, ORDER_DETAIL_STAGE, ...
 # ══════════════════════════════════════════════════════════════
 @asset(
     key=AssetKey("ingest_daily_data"),
@@ -56,6 +60,7 @@ def ingest_daily_data(context):
     3) Compare STAGE row counts vs previous SOURCE row counts
        using METRICS.THRESHOLD_CONFIG (MAX_INSERT_PCT, MAX_DELETE_PCT)
     4) If all checks pass -> MERGE *_STAGE into SOURCE.*
+       (plus optional delete sync)
        If any check fails -> raise Exception (SOURCE stays last good),
        dbt job will NOT run.
     """
@@ -291,7 +296,7 @@ def ingest_daily_data(context):
             )
 
         # ══════════════════════════════════════════════
-        # STEP 4: MERGE *_STAGE INTO SOURCE.*
+        # STEP 4: MERGE *_STAGE INTO SOURCE.* + optional deletes
         # ══════════════════════════════════════════════
         context.log.info("")
         context.log.info("=" * 60)
@@ -310,8 +315,6 @@ def ingest_daily_data(context):
             WHEN NOT MATCHED THEN
               INSERT (ID, NAME)
               VALUES (src.ID, src.NAME)
-            WHEN NOT MATCHED BY SOURCE THEN
-              DELETE
             """,
 
             # ORDER_DETAIL
@@ -330,8 +333,6 @@ def ingest_daily_data(context):
             WHEN NOT MATCHED THEN
               INSERT (ID, CUSTOMER, ORDERED_AT, STORE_ID, SUBTOTAL, TAX_PAID, ORDER_TOTAL)
               VALUES (src.ID, src.CUSTOMER, src.ORDERED_AT, src.STORE_ID, src.SUBTOTAL, src.TAX_PAID, src.ORDER_TOTAL)
-            WHEN NOT MATCHED BY SOURCE THEN
-              DELETE
             """,
 
             # ORDER_ITEM
@@ -346,8 +347,6 @@ def ingest_daily_data(context):
             WHEN NOT MATCHED THEN
               INSERT (ID, ORDER_ID, SKU)
               VALUES (src.ID, src.ORDER_ID, src.SKU)
-            WHEN NOT MATCHED BY SOURCE THEN
-              DELETE
             """,
 
             # PRODUCT
@@ -364,8 +363,6 @@ def ingest_daily_data(context):
             WHEN NOT MATCHED THEN
               INSERT (SKU, NAME, TYPE, PRICE, DESCRIPTION)
               VALUES (src.SKU, src.NAME, src.TYPE, src.PRICE, src.DESCRIPTION)
-            WHEN NOT MATCHED BY SOURCE THEN
-              DELETE
             """,
 
             # STORE
@@ -381,8 +378,6 @@ def ingest_daily_data(context):
             WHEN NOT MATCHED THEN
               INSERT (ID, NAME, OPENED_AT, TAX_RATE)
               VALUES (src.ID, src.NAME, src.OPENED_AT, src.TAX_RATE)
-            WHEN NOT MATCHED BY SOURCE THEN
-              DELETE
             """,
 
             # SUPPLY (ID + SKU as key)
@@ -399,8 +394,6 @@ def ingest_daily_data(context):
             WHEN NOT MATCHED THEN
               INSERT (ID, NAME, COST, PERISHABLE, SKU)
               VALUES (src.ID, src.NAME, src.COST, src.PERISHABLE, src.SKU)
-            WHEN NOT MATCHED BY SOURCE THEN
-              DELETE
             """,
         ]
 
@@ -409,8 +402,67 @@ def ingest_daily_data(context):
             context.log.info(f"  Running MERGE:\n{clean_sql}")
             cursor.execute(clean_sql)
 
+        # Optional: propagate deletes (rows no longer present in STAGE)
+        delete_cmds = [
+            # CUSTOMER deletes: IDs in CUSTOMER but not in CUSTOMER_STAGE
+            """
+            DELETE FROM CUSTOMER tgt
+            WHERE NOT EXISTS (
+              SELECT 1 FROM CUSTOMER_STAGE src WHERE src.ID = tgt.ID
+            )
+            """,
+
+            # ORDER_DETAIL
+            """
+            DELETE FROM ORDER_DETAIL tgt
+            WHERE NOT EXISTS (
+              SELECT 1 FROM ORDER_DETAIL_STAGE src WHERE src.ID = tgt.ID
+            )
+            """,
+
+            # ORDER_ITEM
+            """
+            DELETE FROM ORDER_ITEM tgt
+            WHERE NOT EXISTS (
+              SELECT 1 FROM ORDER_ITEM_STAGE src WHERE src.ID = tgt.ID
+            )
+            """,
+
+            # PRODUCT (by SKU)
+            """
+            DELETE FROM PRODUCT tgt
+            WHERE NOT EXISTS (
+              SELECT 1 FROM PRODUCT_STAGE src WHERE src.SKU = tgt.SKU
+            )
+            """,
+
+            # STORE
+            """
+            DELETE FROM STORE tgt
+            WHERE NOT EXISTS (
+              SELECT 1 FROM STORE_STAGE src WHERE src.ID = tgt.ID
+            )
+            """,
+
+            # SUPPLY (composite key)
+            """
+            DELETE FROM SUPPLY tgt
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM SUPPLY_STAGE src
+              WHERE src.ID = tgt.ID
+                AND src.SKU = tgt.SKU
+            )
+            """,
+        ]
+
+        for sql in delete_cmds:
+            clean_sql = sql.strip()
+            context.log.info(f"  Running DELETE sync:\n{clean_sql}")
+            cursor.execute(clean_sql)
+
         conn.commit()
-        context.log.info("  MERGE completed – SOURCE updated from validated STAGE data")
+        context.log.info("  MERGE + DELETE sync completed – SOURCE updated from validated STAGE data")
 
         # If we reach here, ingestion + validation + thresholds all passed.
         # dbt job will be triggered by trigger_dbt_after_ingestion sensor.
