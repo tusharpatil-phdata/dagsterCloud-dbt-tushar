@@ -39,7 +39,7 @@ load_dotenv()
 #    Assumes these exist in Snowflake:
 #      - STAGE  : SOURCE.ADLS_RAW_STAGE
 #      - FORMAT : SOURCE.CSV_FORMAT
-#      - STAGE TABLES: CUSTOMER_STAGE, ORDER_DETAIL_STAGE, ...
+#      - STAGE TABLES: CUSTOMER_STAGE, ORDER_DETAIL_STAGE, ..., DISCOUNT_STAGE
 # ══════════════════════════════════════════════════════════════
 @asset(
     key=AssetKey("ingest_daily_data"),
@@ -53,7 +53,7 @@ def ingest_daily_data(context):
     Per run:
 
     1) COPY CSVs from ADLS into *_STAGE tables
-       (CUSTOMER_STAGE, ORDER_DETAIL_STAGE, etc.)
+       (CUSTOMER_STAGE, ORDER_DETAIL_STAGE, ..., DISCOUNT_STAGE)
     2) Validate *_STAGE:
          - Non-empty
          - Key columns not NULL
@@ -90,6 +90,7 @@ def ingest_daily_data(context):
             "PRODUCT",
             "STORE",
             "SUPPLY",
+            "DISCOUNT",          # NEW: discount entity
         ]
 
         # 1a) Capture previous SOURCE row counts for thresholds
@@ -107,6 +108,7 @@ def ingest_daily_data(context):
             "TRUNCATE TABLE PRODUCT_STAGE",
             "TRUNCATE TABLE STORE_STAGE",
             "TRUNCATE TABLE SUPPLY_STAGE",
+            "TRUNCATE TABLE DISCOUNT_STAGE",   # NEW
         ]
         for sql in truncate_stage_cmds:
             context.log.info(f"  Running: {sql}")
@@ -144,6 +146,12 @@ def ingest_daily_data(context):
             FROM @SOURCE.ADLS_RAW_STAGE/supply.csv
             FILE_FORMAT = (FORMAT_NAME = SOURCE.CSV_FORMAT)
             """,
+            # NEW: discounts.csv
+            """
+            COPY INTO DISCOUNT_STAGE
+            FROM @SOURCE.ADLS_RAW_STAGE/discounts.csv
+            FILE_FORMAT = (FORMAT_NAME = SOURCE.CSV_FORMAT)
+            """,
         ]
         for sql in copy_stage_cmds:
             clean_sql = sql.strip()
@@ -171,6 +179,7 @@ def ingest_daily_data(context):
             "PRODUCT_STAGE":       {"key_cols": ["SKU", "NAME"]},
             "STORE_STAGE":         {"key_cols": ["ID", "NAME"]},
             "SUPPLY_STAGE":        {"key_cols": ["ID", "SKU", "NAME"]},
+            "DISCOUNT_STAGE":      {"key_cols": ["ID", "CUSTOMER_ID"]},  # NEW
         }
 
         stage_counts = {}
@@ -234,6 +243,7 @@ def ingest_daily_data(context):
             "PRODUCT_STAGE":      "PRODUCT",
             "STORE_STAGE":        "STORE",
             "SUPPLY_STAGE":       "SUPPLY",
+            "DISCOUNT_STAGE":     "DISCOUNT",   # NEW
         }
 
         for stage_table, src_table in stage_to_source.items():
@@ -395,6 +405,22 @@ def ingest_daily_data(context):
               INSERT (ID, NAME, COST, PERISHABLE, SKU)
               VALUES (src.ID, src.NAME, src.COST, src.PERISHABLE, src.SKU)
             """,
+
+            # DISCOUNT (new entity)
+            """
+            MERGE INTO DISCOUNT AS tgt
+            USING DISCOUNT_STAGE AS src
+              ON tgt.ID = src.ID
+            WHEN MATCHED THEN
+              UPDATE SET
+                tgt.CUSTOMER_ID = src.CUSTOMER_ID,
+                tgt.PERCENT     = src.PERCENT,
+                tgt.VALID_FROM  = src.VALID_FROM,
+                tgt.VALID_TO    = src.VALID_TO
+            WHEN NOT MATCHED THEN
+              INSERT (ID, CUSTOMER_ID, PERCENT, VALID_FROM, VALID_TO)
+              VALUES (src.ID, src.CUSTOMER_ID, src.PERCENT, src.VALID_FROM, src.VALID_TO)
+            """,
         ]
 
         for sql in merge_cmds:
@@ -452,6 +478,14 @@ def ingest_daily_data(context):
               FROM SUPPLY_STAGE src
               WHERE src.ID = tgt.ID
                 AND src.SKU = tgt.SKU
+            )
+            """,
+
+            # DISCOUNT
+            """
+            DELETE FROM DISCOUNT tgt
+            WHERE NOT EXISTS (
+              SELECT 1 FROM DISCOUNT_STAGE src WHERE src.ID = tgt.ID
             )
             """,
         ]
@@ -653,7 +687,7 @@ def trigger_dbt_retry(context: RunStatusSensorContext):
     context.log.info("  Only failed models from the last run will be re-executed.")
 
 # ══════════════════════════════════════════════════════════════
-# 5d. LOG RECORD COUNTS TO SNOWFLAKE (ALL 24 TABLES)
+# 5d. LOG RECORD COUNTS TO SNOWFLAKE (now includes DISCOUNT)
 # ══════════════════════════════════════════════════════════════
 def log_record_counts(context: RunStatusSensorContext):
     """Query row counts per layer, log with before/after, apply thresholds."""
@@ -674,7 +708,7 @@ def log_record_counts(context: RunStatusSensorContext):
         MAX_DELETE_PCT = 10
         MIN_ROWS = 1
 
-        # All 24 tables across 4 layers
+        # All tables across 4 layers (now 7 entities incl. DISCOUNT)
         tables = [
             ("SOURCE", "CUSTOMER"),
             ("LZ", "RAW_CUSTOMER"),
@@ -705,6 +739,12 @@ def log_record_counts(context: RunStatusSensorContext):
             ("LZ", "RAW_SUPPLY"),
             ("STAGING", "STG_SUPPLY"),
             ("DBO", "DIM_SUPPLY"),
+
+            # NEW: discount medallion
+            ("SOURCE", "DISCOUNT"),
+            ("LZ", "RAW_DISCOUNT"),
+            ("STAGING", "STG_DISCOUNT"),
+            ("DBO", "DIM_DISCOUNT"),
         ]
 
         alerts = []
@@ -853,6 +893,7 @@ def log_source_counts(context: RunStatusSensorContext):
             ("SOURCE", "PRODUCT"),
             ("SOURCE", "STORE"),
             ("SOURCE", "SUPPLY"),
+            ("SOURCE", "DISCOUNT"),   # NEW
         ]
 
         context.log.info("=" * 60)
@@ -920,7 +961,7 @@ def log_success_to_snowflake(context: RunStatusSensorContext):
     """
     Fires after every successful Dagster run.
     - After ingestion: logs job status + SOURCE row counts only
-    - After dbt: logs job status + all 24 table row counts
+    - After dbt: logs job status + all layer row counts
     """
     write_run_to_snowflake(context, status="SUCCESS")
 
@@ -931,7 +972,7 @@ def log_success_to_snowflake(context: RunStatusSensorContext):
         except Exception as e:
             context.log.warning(f"  Could not log source counts: {e}")
     elif context.dagster_run.job_name == "trigger_dbt_cloud_job":
-        # After dbt — log all 24 table counts
+        # After dbt — log all layer counts (incl. DISCOUNT chain)
         try:
             log_record_counts(context)
         except Exception as e:
@@ -974,7 +1015,7 @@ ingestion_job = define_asset_job(
     executor_def=in_process_executor,
 )
 
-# Job that runs ONLY dbt Cloud models
+# Job that runs ONLY dbt Cloud models (auto-discovers new dbt assets)
 dbt_job = define_asset_job(
     name="trigger_dbt_cloud_job",
     selection=AssetSelection.all() - AssetSelection.keys(AssetKey("ingest_daily_data")),
