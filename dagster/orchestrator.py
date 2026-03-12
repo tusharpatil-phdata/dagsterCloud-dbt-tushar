@@ -29,7 +29,9 @@ from dagster_dbt import (
 )
 
 # ══════════════════════════════════════════════════════════════
+
 # 1. LOAD SECRETS
+
 # ══════════════════════════════════════════════════════════════
 load_dotenv()
 
@@ -63,6 +65,8 @@ def ingest_daily_data(context):
        (plus optional delete sync)
        If any check fails -> raise Exception (SOURCE stays last good),
        dbt job will NOT run.
+    5) After MERGE + DELETE, record INSERT / UPDATE / DELETE counts
+       per SOURCE table using Snowflake streams (SOURCE_DML_AUDIT).
     """
     conn = None
     try:
@@ -90,7 +94,7 @@ def ingest_daily_data(context):
             "PRODUCT",
             "STORE",
             "SUPPLY",
-            "DISCOUNT",          # NEW: discount entity
+            "DISCOUNT",          
         ]
 
         # 1a) Capture previous SOURCE row counts for thresholds
@@ -498,6 +502,15 @@ def ingest_daily_data(context):
         conn.commit()
         context.log.info("  MERGE + DELETE sync completed – SOURCE updated from validated STAGE data")
 
+        # STEP 5: record per-table INSERT/UPDATE/DELETE using streams
+        try:
+            record_source_dml_audit(context, cursor)
+            conn.commit()
+            context.log.info("  SOURCE DML audit written to METRICS.SOURCE_DML_AUDIT")
+        except Exception as e:
+            # Do not fail the run if audit write fails; just log it
+            context.log.warning(f"  Could not record SOURCE DML audit: {e}")
+
         # If we reach here, ingestion + validation + thresholds all passed.
         # dbt job will be triggered by trigger_dbt_after_ingestion sensor.
         return Output(None)
@@ -510,7 +523,71 @@ def ingest_daily_data(context):
             conn.close()
 
 # ══════════════════════════════════════════════════════════════
+
+# 2b. HELPER: RECORD PER-RUN INSERT/UPDATE/DELETE COUNTS
+
+#     Reads from Snowflake streams on each SOURCE table:
+
+#       - CUSTOMER_CHANGES, ORDER_DETAIL_CHANGES, ..., DISCOUNT_CHANGES
+
+#     and writes one row per table into METRICS.SOURCE_DML_AUDIT
+
+# ══════════════════════════════════════════════════════════════
+def record_source_dml_audit(context, cursor):
+    """
+    For each SOURCE table:
+
+    - Reads its stream (e.g., SOURCE.CUSTOMER_CHANGES)
+    - Counts INSERT/UPDATE/DELETE using METADATA$ACTION + METADATA$ISUPDATE
+    - Inserts a row into METRICS.SOURCE_DML_AUDIT
+
+    Notes:
+    - In a table stream, an UPDATE appears as two rows:
+        * one DELETE (old version)
+        * one INSERT (new version)
+      Both have METADATA$ISUPDATE = TRUE.
+    - Pure INSERT: METADATA$ACTION='INSERT', METADATA$ISUPDATE=FALSE
+    - Pure DELETE: METADATA$ACTION='DELETE', METADATA$ISUPDATE=FALSE
+    """
+    dagster_run_id = context.run_id
+
+    tables_and_streams = [
+        ("CUSTOMER",      "CUSTOMER_CHANGES"),
+        ("ORDER_DETAIL",  "ORDER_DETAIL_CHANGES"),
+        ("ORDER_ITEM",    "ORDER_ITEM_CHANGES"),
+        ("PRODUCT",       "PRODUCT_CHANGES"),
+        ("STORE",         "STORE_CHANGES"),
+        ("SUPPLY",        "SUPPLY_CHANGES"),
+        ("DISCOUNT",      "DISCOUNT_CHANGES"),  # if DISCOUNT stream created
+    ]
+
+    for table_name, stream_name in tables_and_streams:
+        # Compute DML counts from stream
+        query = f"""
+            SELECT
+              COALESCE(SUM(IFF(METADATA$ISUPDATE, 1, 0)) / 2, 0) AS UPDATE_COUNT,
+              COALESCE(SUM(IFF(NOT METADATA$ISUPDATE AND METADATA$ACTION = 'INSERT', 1, 0)), 0) AS INSERT_COUNT,
+              COALESCE(SUM(IFF(NOT METADATA$ISUPDATE AND METADATA$ACTION = 'DELETE', 1, 0)), 0) AS DELETE_COUNT
+            FROM SOURCE.{stream_name}
+        """
+        cursor.execute(query)
+        upd_cnt, ins_cnt, del_cnt = cursor.fetchone()
+
+        # Insert one audit row per table for this run
+        cursor.execute(
+            """
+            INSERT INTO METRICS.SOURCE_DML_AUDIT
+              (DAGSTER_RUN_ID, TABLE_NAME, INSERT_COUNT, UPDATE_COUNT, DELETE_COUNT, LOGGED_AT)
+            VALUES (%s, %s, %s, %s, %s,
+                    CONVERT_TIMEZONE('America/Los_Angeles', 'Asia/Kolkata', CURRENT_TIMESTAMP()))
+            """,
+            (dagster_run_id, table_name, ins_cnt, upd_cnt, del_cnt),
+        )
+
+# ══════════════════════════════════════════════════════════════
+
 # 3. CONFIGURE dbt CLOUD CONNECTION
+
 # ══════════════════════════════════════════════════════════════
 dbt_cloud_connection = dbt_cloud_resource.configured(
     {
@@ -521,7 +598,9 @@ dbt_cloud_connection = dbt_cloud_resource.configured(
 )
 
 # ══════════════════════════════════════════════════════════════
+
 # 4. AUTO-DISCOVER dbt MODELS FROM dbt CLOUD JOB
+
 # ══════════════════════════════════════════════════════════════
 customer_dbt_assets = load_assets_from_dbt_cloud_job(
     dbt_cloud=dbt_cloud_connection,
@@ -529,7 +608,9 @@ customer_dbt_assets = load_assets_from_dbt_cloud_job(
 )
 
 # ══════════════════════════════════════════════════════════════
+
 # 5a. SNOWFLAKE AUDIT LOGGING (IST timestamps)
+
 # ══════════════════════════════════════════════════════════════
 def write_run_to_snowflake(
     context: RunStatusSensorContext,
@@ -575,7 +656,9 @@ def write_run_to_snowflake(
             conn.close()
 
 # ══════════════════════════════════════════════════════════════
+
 # 5b. FETCH dbt CLOUD RUN DETAILS + LOG TO SNOWFLAKE
+
 # ══════════════════════════════════════════════════════════════
 def fetch_dbt_run_results(context: RunStatusSensorContext):
     """Fetch per-model results from dbt Cloud and log to Snowflake."""
@@ -659,7 +742,9 @@ def fetch_dbt_run_results(context: RunStatusSensorContext):
             conn.close()
 
 # ══════════════════════════════════════════════════════════════
+
 # 5c. TRIGGER dbt RETRY JOB ON FAILURE
+
 # ══════════════════════════════════════════════════════════════
 def trigger_dbt_retry(context: RunStatusSensorContext):
     """Trigger the dbt retry job to rerun only failed models."""
@@ -687,7 +772,9 @@ def trigger_dbt_retry(context: RunStatusSensorContext):
     context.log.info("  Only failed models from the last run will be re-executed.")
 
 # ══════════════════════════════════════════════════════════════
-# 5d. LOG RECORD COUNTS TO SNOWFLAKE (now includes DISCOUNT)
+
+# 5d. LOG RECORD COUNTS TO SNOWFLAKE (includes DISCOUNT chain)
+
 # ══════════════════════════════════════════════════════════════
 def log_record_counts(context: RunStatusSensorContext):
     """Query row counts per layer, log with before/after, apply thresholds."""
@@ -708,7 +795,6 @@ def log_record_counts(context: RunStatusSensorContext):
         MAX_DELETE_PCT = 10
         MIN_ROWS = 1
 
-        # All tables across 4 layers (now 7 entities incl. DISCOUNT)
         tables = [
             ("SOURCE", "CUSTOMER"),
             ("LZ", "RAW_CUSTOMER"),
@@ -740,7 +826,6 @@ def log_record_counts(context: RunStatusSensorContext):
             ("STAGING", "STG_SUPPLY"),
             ("DBO", "DIM_SUPPLY"),
 
-            # NEW: discount medallion
             ("SOURCE", "DISCOUNT"),
             ("LZ", "RAW_DISCOUNT"),
             ("STAGING", "STG_DISCOUNT"),
@@ -753,7 +838,6 @@ def log_record_counts(context: RunStatusSensorContext):
         context.log.info("  RECORD COUNTS (all layers) + SOURCE THRESHOLDS")
         context.log.info("=" * 60)
 
-        # Read per-table thresholds from config for SOURCE tables
         cursor.execute(
             "SELECT TABLE_NAME, MAX_INSERT_PCT, MAX_UPDATE_PCT, MAX_DELETE_PCT "
             "FROM METRICS.THRESHOLD_CONFIG"
@@ -772,11 +856,9 @@ def log_record_counts(context: RunStatusSensorContext):
         context.log.info("-" * 60)
 
         for schema, table in tables:
-            # Current row count
             cursor.execute(f"SELECT COUNT(*) FROM {schema}.{table}")
             rows_after = cursor.fetchone()[0]
 
-            # Previous run row count
             cursor.execute(
                 """
                 SELECT ROWS_AFTER FROM METRICS.LAYER_ROW_COUNTS
@@ -789,7 +871,6 @@ def log_record_counts(context: RunStatusSensorContext):
             rows_before = prev[0] if prev else 0
             rows_added = rows_after - rows_before
 
-            # Determine change type
             if rows_before == 0 and rows_after > 0:
                 inserted = rows_after
                 deleted = 0
@@ -807,7 +888,6 @@ def log_record_counts(context: RunStatusSensorContext):
                 deleted = abs(rows_added)
                 change_type = f"-{deleted:,} DELETED"
 
-            # Save to Snowflake
             cursor.execute(
                 """
                 INSERT INTO METRICS.LAYER_ROW_COUNTS
@@ -824,7 +904,6 @@ def log_record_counts(context: RunStatusSensorContext):
                 f"  {schema}.{table}: {rows_before:,} -> {rows_after:,} ({change_type})"
             )
 
-            # Threshold checks ONLY for SOURCE layer (using config table values)
             if rows_before > 0 and schema == "SOURCE":
                 t = thresholds.get(table, {"insert": MAX_INSERT_PCT, "delete": MAX_DELETE_PCT})
                 t_insert = t.get("insert", MAX_INSERT_PCT)
@@ -844,7 +923,6 @@ def log_record_counts(context: RunStatusSensorContext):
                     context.log.error(f"    >> {msg}")
                     alerts.append(msg)
 
-            # Empty table check
             if rows_after < MIN_ROWS and rows_before > 0:
                 msg = f"EMPTY: {schema}.{table} has {rows_after} rows after pipeline run!"
                 context.log.error(f"    >> {msg}")
@@ -852,7 +930,6 @@ def log_record_counts(context: RunStatusSensorContext):
 
         conn.commit()
 
-        # Summary
         context.log.info("-" * 60)
         if alerts:
             context.log.warning(f"  {len(alerts)} THRESHOLD ALERT(S):")
@@ -870,7 +947,9 @@ def log_record_counts(context: RunStatusSensorContext):
             conn.close()
 
 # ══════════════════════════════════════════════════════════════
+
 # 5e. LOG SOURCE TABLE COUNTS AFTER INGESTION
+
 # ══════════════════════════════════════════════════════════════
 def log_source_counts(context: RunStatusSensorContext):
     """Log row counts for SOURCE tables only — runs after ingestion."""
@@ -893,7 +972,7 @@ def log_source_counts(context: RunStatusSensorContext):
             ("SOURCE", "PRODUCT"),
             ("SOURCE", "STORE"),
             ("SOURCE", "SUPPLY"),
-            ("SOURCE", "DISCOUNT"),   # NEW
+            ("SOURCE", "DISCOUNT"),
         ]
 
         context.log.info("=" * 60)
@@ -951,7 +1030,9 @@ def log_source_counts(context: RunStatusSensorContext):
             conn.close()
 
 # ══════════════════════════════════════════════════════════════
+
 # 6. SENSORS
+
 # ══════════════════════════════════════════════════════════════
 @run_status_sensor(
     run_status=DagsterRunStatus.SUCCESS,
@@ -1005,7 +1086,9 @@ def log_failure_to_snowflake(context: RunStatusSensorContext):
         context.log.info("  Ingestion failed — dbt will not run, no retry needed")
 
 # ══════════════════════════════════════════════════════════════
+
 # 7. JOBS
+
 # ══════════════════════════════════════════════════════════════
 
 # Job that runs ONLY ingestion + validation + thresholds
@@ -1023,7 +1106,9 @@ dbt_job = define_asset_job(
 )
 
 # ══════════════════════════════════════════════════════════════
+
 # 8. SENSOR: Run dbt ONLY after ingestion succeeds
+
 # ══════════════════════════════════════════════════════════════
 @run_status_sensor(
     run_status=DagsterRunStatus.SUCCESS,
@@ -1042,7 +1127,9 @@ def trigger_dbt_after_ingestion(context: RunStatusSensorContext):
     return RunRequest()
 
 # ══════════════════════════════════════════════════════════════
+
 # 9. SCHEDULE
+
 # ══════════════════════════════════════════════════════════════
 daily_schedule = ScheduleDefinition(
     job=ingestion_job,
@@ -1051,7 +1138,9 @@ daily_schedule = ScheduleDefinition(
 )
 
 # ══════════════════════════════════════════════════════════════
+
 # 10. REGISTER EVERYTHING
+
 # ══════════════════════════════════════════════════════════════
 defs = Definitions(
     assets=[ingest_daily_data, customer_dbt_assets],
