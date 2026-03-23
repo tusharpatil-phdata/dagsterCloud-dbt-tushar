@@ -1,7 +1,7 @@
-name: dagsterCloud-dbt-project
+name: dagstercloud_dbt_project
 version: '1.0.0'
 config-version: 2
-profile: dagsterCloud-dbt-project
+profile: dagstercloud_dbt_project
 
 model-paths:    [models]
 seed-paths:     [seeds]
@@ -13,7 +13,7 @@ target-path: target
 clean-targets: [target, dbt_packages]
 
 models:
-  dagsterCloud-dbt-project:
+  dagstercloud_dbt_project:
     lz:
       +database: DAGSTER_DBT_KIEWIT_DB_CLOUD
       +schema: lz
