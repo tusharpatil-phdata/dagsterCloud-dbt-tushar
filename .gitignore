@@ -1,8 +1,8 @@
+rsa_key.p8
+rsa_key.pub
 .env
-.venv/
 __pycache__/
 *.pyc
+.tmp_dagster_home*/
 target/
 dbt_packages/
-logs/
-dagster_home/

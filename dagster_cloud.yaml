@@ -1,0 +1,4 @@
+locations:
+  - location_name: medallion_elt_pipeline
+    code_source:
+      python_file: dagster_code/definitions.py
