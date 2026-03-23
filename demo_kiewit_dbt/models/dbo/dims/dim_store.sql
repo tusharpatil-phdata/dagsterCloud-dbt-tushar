@@ -2,7 +2,7 @@
   config(
     materialized = 'table',
     transient = false,
-    database     = 'DAGSTER_DBT_KIEWIT_DB',
+    database     = 'DAGSTER_DBT_KIEWIT_DB_CLOUD',
     schema       = 'dbo',
     tags         = ['dbo', 'gold']
   )

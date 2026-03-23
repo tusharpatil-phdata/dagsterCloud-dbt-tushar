@@ -1,7 +1,7 @@
 {{
   config(
     materialized = 'view',
-    database     = 'DAGSTER_DBT_KIEWIT_DB',
+    database     = 'DAGSTER_DBT_KIEWIT_DB_CLOUD',
     schema       = 'staging',
     tags         = ['staging', 'silver']
   )

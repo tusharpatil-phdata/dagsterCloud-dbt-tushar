@@ -3,7 +3,7 @@ version: 2
 sources:
   - name: raw_customer
     description: 'Raw Jaffle Shop customer loaded into SOURCE schema'
-    database: DAGSTER_DBT_KIEWIT_DB
+    database: DAGSTER_DBT_KIEWIT_DB_CLOUD
     schema: SOURCE
     tables:
       - name: CUSTOMER
@@ -19,7 +19,7 @@ sources:
 
   - name: raw_order_detail
     description: 'Raw order_detail headers from order_detail.csv'
-    database: DAGSTER_DBT_KIEWIT_DB
+    database: DAGSTER_DBT_KIEWIT_DB_CLOUD
     schema: SOURCE
     tables:
       - name: ORDER_DETAIL
@@ -37,7 +37,7 @@ sources:
 
   - name: raw_order_item
     description: 'Raw order item from order_item.csv'
-    database: DAGSTER_DBT_KIEWIT_DB
+    database: DAGSTER_DBT_KIEWIT_DB_CLOUD
     schema: SOURCE
     tables:
       - name: ORDER_ITEM
@@ -55,7 +55,7 @@ sources:
 
   - name: raw_product
     description: 'Raw product from product.csv'
-    database: DAGSTER_DBT_KIEWIT_DB
+    database: DAGSTER_DBT_KIEWIT_DB_CLOUD
     schema: SOURCE
     tables:
       - name: PRODUCT
@@ -70,7 +70,7 @@ sources:
 
   - name: raw_store
     description: 'Raw store from store.csv'
-    database: DAGSTER_DBT_KIEWIT_DB
+    database: DAGSTER_DBT_KIEWIT_DB_CLOUD
     schema: SOURCE
     tables:
       - name: STORE
@@ -85,7 +85,7 @@ sources:
 
   - name: raw_supply
     description: 'Raw supplies from supply.csv'
-    database: DAGSTER_DBT_KIEWIT_DB
+    database: DAGSTER_DBT_KIEWIT_DB_CLOUD
     schema: SOURCE
     tables:
       - name: SUPPLY
@@ -100,7 +100,7 @@ sources:
 
   - name: raw_discount
     description: 'Raw discount data loaded into SOURCE schema'
-    database: DAGSTER_DBT_KIEWIT_DB
+    database: DAGSTER_DBT_KIEWIT_DB_CLOUD
     schema: SOURCE
     tables:
       - name: DISCOUNT
