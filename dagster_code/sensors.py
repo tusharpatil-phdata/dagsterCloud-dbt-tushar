@@ -1,92 +1,54 @@
-"""Sensors: success/failure audit logging (lightweight — no timeout)."""
+"""Sensors: lightweight orchestration only — no Snowflake calls.
+   All heavy work (audit, row counts, dbt results) is done inside assets."""
 
-from dagster import RunStatusSensorContext, run_status_sensor, DagsterRunStatus, DefaultSensorStatus
-from dagster_code.helpers.audit import write_run_to_snowflake, log_source_counts, log_all_layer_counts
-from dagster_code.helpers.dbt_cloud import trigger_retry
+from dagster import (
+    RunStatusSensorContext,
+    run_status_sensor,
+    DagsterRunStatus,
+    DefaultSensorStatus,
+)
 
-@run_status_sensor(run_status=DagsterRunStatus.SUCCESS, default_status=DefaultSensorStatus.RUNNING)
+@run_status_sensor(
+    run_status=DagsterRunStatus.SUCCESS,
+    default_status=DefaultSensorStatus.RUNNING,
+    minimum_interval_seconds=120,
+)
 def log_success_to_snowflake(context: RunStatusSensorContext):
-    """On success: log run status to DAGSTER_JOB_RUNS. Row counts logged separately."""
-    try:
-        write_run_to_snowflake(context, "SUCCESS")
-    except Exception as e:
-        context.log.warning(f"  Audit log error: {e}")
-
+    """Log success info to Dagster logs only — actual METRICS written by assets."""
     job = context.dagster_run.job_name
-    if job == "run_ingestion_job":
-        try:
-            log_source_counts(context)
-        except Exception as e:
-            context.log.warning(f"  Source count error: {e}")
-    elif job == "run_dbt_cloud_job":
-        try:
-            log_all_layer_counts(context)
-        except Exception as e:
-            context.log.warning(f"  Layer count error: {e}")
-        # NOTE: fetch_and_log_dbt_results removed from sensor to avoid timeout
-        # dbt model results can be viewed directly in dbt Cloud UI
+    run_id = context.dagster_run.run_id
+    context.log.info(f"  ✅ SUCCESS: Job '{job}' completed (Run: {run_id})")
 
-@run_status_sensor(run_status=DagsterRunStatus.FAILURE, default_status=DefaultSensorStatus.RUNNING)
+@run_status_sensor(
+    run_status=DagsterRunStatus.FAILURE,
+    default_status=DefaultSensorStatus.RUNNING,
+    minimum_interval_seconds=120,
+)
 def log_failure_to_snowflake(context: RunStatusSensorContext):
-    """On failure: log error + auto-retry dbt if applicable."""
-    err = None
-    try:
-        if context.failure_event and context.failure_event.step_failure_data:
-            err = {"error_message": context.failure_event.step_failure_data.error.message}
-    except Exception:
-        pass
-
-    try:
-        write_run_to_snowflake(context, "FAILURE", err)
-    except Exception as e:
-        context.log.warning(f"  Audit log error: {e}")
-
-    if context.dagster_run.job_name == "run_dbt_cloud_job":
-        try:
-            trigger_retry(context)
-        except Exception as e:
-            context.log.warning(f"  Retry trigger error: {e}")
-    else:
-        context.log.info("  Ingestion failed → dbt will NOT run")
-
-'''
-"""Sensors: success/failure audit logging."""
-
-from dagster import RunStatusSensorContext, run_status_sensor, DagsterRunStatus, DefaultSensorStatus
-from dagster_code.helpers.audit import write_run_to_snowflake, log_source_counts, log_all_layer_counts
-from dagster_code.helpers.dbt_cloud import trigger_retry, fetch_and_log_dbt_results
-
-
-@run_status_sensor(run_status=DagsterRunStatus.SUCCESS, default_status=DefaultSensorStatus.RUNNING)
-def log_success_to_snowflake(context: RunStatusSensorContext):
-    """On success: log run + layer-appropriate counts + dbt model results."""
-    write_run_to_snowflake(context, "SUCCESS")
+    """Log failure + trigger dbt retry (lightweight HTTP call only)."""
     job = context.dagster_run.job_name
-    if job == "run_ingestion_job":
-        try:
-            log_source_counts(context)
-        except Exception as e:
-            context.log.warning(f"  Source count error: {e}")
-    elif job == "run_dbt_cloud_job":
-        try:
-            log_all_layer_counts(context)
-            fetch_and_log_dbt_results(context)
-        except Exception as e:
-            context.log.warning(f"  Post-dbt logging error: {e}")
+    run_id = context.dagster_run.run_id
+    context.log.info(f"  ❌ FAILURE: Job '{job}' failed (Run: {run_id})")
 
-
-@run_status_sensor(run_status=DagsterRunStatus.FAILURE, default_status=DefaultSensorStatus.RUNNING)
-def log_failure_to_snowflake(context: RunStatusSensorContext):
-    """On failure: log error + auto-retry dbt if applicable."""
-    err = None
-    if context.failure_event and context.failure_event.step_failure_data:
-        err = {"error_message": context.failure_event.step_failure_data.error.message}
-    write_run_to_snowflake(context, "FAILURE", err)
-    if context.dagster_run.job_name == "run_dbt_cloud_job":
+    if job == "run_dbt_cloud_job":
         try:
-            trigger_retry(context)
+            import os
+            import requests
+            retry_id = os.getenv("DBT_RETRY_JOB_ID")
+            if retry_id:
+                resp = requests.post(
+                    f"{os.getenv('DBT_CLOUD_HOST')}/api/v2/accounts/"
+                    f"{os.getenv('DBT_CLOUD_ACCOUNT_ID')}/jobs/{retry_id}/run/",
+                    headers={
+                        "Authorization": f"Token {os.getenv('DBT_CLOUD_API_TOKEN')}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"cause": "Dagster+ auto-retry on dbt failure"},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                context.log.info(
+                    f"  Retry triggered: dbt Run ID {resp.json()['data']['id']}"
+                )
         except Exception as e:
-            context.log.warning(f"  Retry trigger error: {e}")
-    else:
-        context.log.info("  Ingestion failed → dbt will NOT run (sensor will not fire)")
-'''
+            context.log.warning(f"  Retry error: {e}")

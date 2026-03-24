@@ -1,25 +1,20 @@
-"""Ingestion asset: ADLS → STAGE → Validate → Threshold → MERGE → DML Audit."""
+"""Ingestion asset: ADLS → STAGE → Validate → Threshold → MERGE → DML Audit → METRICS."""
 
 from dagster import asset, AssetKey, Output, RetryPolicy
 from dagster_code.config import TABLES, COMPOUND_PK, TZ_NOW
 from dagster_code.snowflake_client import get_connection
 
-
 def _merge_on_clause(t) -> str:
-    """Build MERGE ON clause — handles compound PKs."""
     cpk = COMPOUND_PK.get(t.name)
     if cpk:
         return " AND ".join(f"tgt.{c}=src.{c}" for c in cpk)
     return f"tgt.{t.pk}=src.{t.pk}"
 
-
 def _delete_where(t) -> str:
-    """Build DELETE NOT EXISTS WHERE clause."""
     cpk = COMPOUND_PK.get(t.name)
     if cpk:
         return " AND ".join(f"src.{c}=tgt.{c}" for c in cpk)
     return f"src.{t.pk}=tgt.{t.pk}"
-
 
 def _build_merge(t) -> str:
     on = _merge_on_clause(t)
@@ -32,17 +27,15 @@ def _build_merge(t) -> str:
         f"WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({vals})"
     )
 
-
 def _build_delete(t) -> str:
     where = _delete_where(t)
     return f"DELETE FROM {t.name} tgt WHERE NOT EXISTS (SELECT 1 FROM {t.name}_STAGE src WHERE {where})"
-
 
 @asset(
     key=AssetKey("ingest_daily_data"),
     group_name="ingestion",
     compute_kind="snowflake",
-    description="ADLS → STAGE → Validate → Threshold → MERGE into SOURCE → DML Audit",
+    description="ADLS → STAGE → Validate → Threshold → MERGE → DML Audit → Log to METRICS",
     retry_policy=RetryPolicy(max_retries=2, delay=30),
 )
 def ingest_daily_data(context):
@@ -128,6 +121,7 @@ def ingest_daily_data(context):
         context.log.info("  MERGE + DELETE sync completed ✓")
 
         # ── STEP 5: DML audit via Snowflake streams ──
+        context.log.info("=" * 55 + "\n  STEP 5: DML AUDIT\n" + "=" * 55)
         try:
             run_id = context.run_id
             for t in TABLES:
@@ -144,11 +138,41 @@ def ingest_daily_data(context):
                     (run_id, t.name, ins, upd, dlt),
                 )
             conn.commit()
-            context.log.info("  DML audit written to METRICS.SOURCE_DML_AUDIT ✓")
+            context.log.info("  DML audit → METRICS.SOURCE_DML_AUDIT ✓")
         except Exception as e:
             context.log.warning(f"  DML audit skipped: {e}")
 
-        return Output(None, metadata={"tables_processed": len(TABLES)})
+        # ── STEP 6: Log job run + source row counts to METRICS ──
+        context.log.info("=" * 55 + "\n  STEP 6: LOG RUN + SOURCE COUNTS TO METRICS\n" + "=" * 55)
+        try:
+            run_id = context.run_id
+            # Log job run
+            cur.execute(
+                f"INSERT INTO METRICS.DAGSTER_JOB_RUNS(RUN_ID, JOB_NAME, STATUS, "
+                f"START_TIME, END_TIME, ERROR_MESSAGE, LOGGED_AT) "
+                f"VALUES(%s, 'run_ingestion_job', 'SUCCESS', "
+                f"{TZ_NOW}, {TZ_NOW}, NULL, {TZ_NOW})",
+                (run_id,),
+            )
+            # Log source row counts (before vs after)
+            for t in TABLES:
+                cur.execute(f"SELECT COUNT(*) FROM SOURCE.{t.name}")
+                after = cur.fetchone()[0]
+                cur.execute(
+                    f"INSERT INTO METRICS.LAYER_ROW_COUNTS(DAGSTER_RUN_ID, SCHEMA_NAME, "
+                    f"TABLE_NAME, ROWS_BEFORE, ROWS_AFTER, ROWS_ADDED, LOGGED_AT) "
+                    f"VALUES(%s, 'SOURCE', %s, %s, %s, %s, {TZ_NOW})",
+                    (run_id, t.name, prev[t.name], after, after - prev[t.name]),
+                )
+            conn.commit()
+            context.log.info("  Job run + source counts → METRICS ✓")
+        except Exception as e:
+            context.log.warning(f"  METRICS logging error: {e}")
+
+        return Output(None, metadata={
+            "tables_processed": len(TABLES),
+            "run_id": context.run_id,
+        })
 
     except Exception:
         raise
