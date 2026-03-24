@@ -97,3 +97,17 @@ models:
       - name: discount_pct
         tests:
           - not_null
+
+  - name: stg_loyalty_points
+    description: 'Silver view - cleaned loyalty points per customer'
+    columns:
+      - name: loyalty_points_id
+        tests:
+          - not_null
+          - unique
+      - name: customer_id
+        tests:
+          - not_null
+      - name: points_balance
+        tests:
+          - not_null

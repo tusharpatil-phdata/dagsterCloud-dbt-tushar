@@ -57,3 +57,17 @@ models:
       - name: customer_id
         tests:
           - not_null
+
+  - name: dim_loyalty_points
+    description: 'Gold dimension - loyalty points per customer'
+    columns:
+      - name: loyalty_points_key
+        tests:
+          - not_null
+          - unique
+      - name: customer_id
+        tests:
+          - not_null
+      - name: points_balance
+        tests:
+          - not_null
