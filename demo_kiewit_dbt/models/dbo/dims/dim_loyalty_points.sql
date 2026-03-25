@@ -15,5 +15,5 @@ select
     points_redeemed,
     points_balance_clean,
     as_of_date,
-    current_timestamp() as _updated_at
+    CONVERT_TIMEZONE('America/Los_Angeles', 'Asia/Kolkata', current_timestamp()) as _updated_at
 from {{ ref('stg_loyalty_points') }}

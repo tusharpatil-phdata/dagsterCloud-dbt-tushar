@@ -14,6 +14,6 @@ select
     try_to_number(POINTS_EARNED)   as points_earned,
     try_to_number(POINTS_REDEEMED) as points_redeemed,
     try_to_timestamp_ntz(AS_OF_DATE) as as_of_date,
-    current_timestamp() as _loaded_at,
+    CONVERT_TIMEZONE('America/Los_Angeles', 'Asia/Kolkata', current_timestamp()) as _loaded_at,
     'loyalty_points.csv' as _source_file
 from {{ source('raw_loyalty_points', 'LOYALTY_POINTS') }}
