@@ -359,10 +359,29 @@ def ingest_daily_data(context):
             "run_id": context.run_id,
         })
 
-    except Exception:
+    except Exception as e:
+        # ── Log FAILURE to METRICS before re-raising ──
+        # This ensures DAGSTER_JOB_RUNS has a record even when ingestion fails.
+        # Without this, only SUCCESS runs are audited — failures would be invisible
+        # in Snowflake (only visible in Dagster UI).
+        try:
+            fail_conn = get_connection("METRICS")
+            fail_cur = fail_conn.cursor()
+            fail_cur.execute(
+                f"INSERT INTO DAGSTER_JOB_RUNS(RUN_ID, JOB_NAME, STATUS, "
+                f"START_TIME, END_TIME, ERROR_MESSAGE, LOGGED_AT) "
+                f"VALUES(%s, 'run_ingestion_job', 'FAILURE', "
+                f"{TZ_NOW}, {TZ_NOW}, %s, {TZ_NOW})",
+                (context.run_id, str(e)[:1000]),
+            )
+            fail_conn.commit()
+            fail_conn.close()
+            context.log.info("  FAILURE logged to DAGSTER_JOB_RUNS")
+        except Exception as log_err:
+            context.log.warning(f"  Could not log failure: {log_err}")
         # Re-raise so Dagster marks the run as FAILED
         # This prevents the dbt sensor from firing
         raise
     finally:
-        # ALWAYS close the Snowflake connection — even on error
+        # ALWAYS close the main connection — even on error
         conn.close()
