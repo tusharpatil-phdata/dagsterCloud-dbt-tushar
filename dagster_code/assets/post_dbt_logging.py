@@ -1,17 +1,17 @@
-"""Post-dbt asset: logs dbt model results + all layer row counts to METRICS.
-   Runs as a regular asset (no sensor timeout issues)."""
+"""Post-dbt asset: logs dbt model results + LZ/STAGING/DBO row counts to METRICS.
+   SOURCE counts are already logged by the ingestion asset — no duplication."""
 
 import os
 import requests
 from dagster import asset, AssetKey, Output
-from dagster_code.config import ALL_LAYERS, TZ_NOW
+from dagster_code.config import DBT_LAYERS, TZ_NOW
 from dagster_code.snowflake_client import get_connection
 
 @asset(
     key=AssetKey("log_dbt_results_to_metrics"),
     group_name="audit",
     compute_kind="snowflake",
-    description="Log dbt model results + all layer row counts to METRICS tables",
+    description="Log dbt model results + LZ/STAGING/DBO row counts (with delta) to METRICS",
 )
 def log_dbt_results_to_metrics(context):
     conn = get_connection("METRICS")
@@ -30,21 +30,44 @@ def log_dbt_results_to_metrics(context):
         )
         context.log.info("  dbt job run → DAGSTER_JOB_RUNS ✓")
 
-        # ── 2. Log all layer row counts ──
-        context.log.info("=" * 55 + "\n  LOG ALL LAYER ROW COUNTS\n" + "=" * 55)
-        for schema, tbl in ALL_LAYERS:
+        # ── 2. Log LZ / STAGING / DBO row counts (with delta from previous run) ──
+        context.log.info("=" * 55 + "\n  LOG LZ / STAGING / DBO ROW COUNTS\n" + "=" * 55)
+        for schema, tbl in DBT_LAYERS:
+            # Current count
             try:
                 cur.execute(f"SELECT COUNT(*) FROM {schema}.{tbl}")
-                cnt = cur.fetchone()[0]
+                rows_after = cur.fetchone()[0]
             except Exception:
-                cnt = -1  # table may not exist yet
+                rows_after = -1
+
+            # Previous count from last run
+            cur.execute(
+                "SELECT ROWS_AFTER FROM LAYER_ROW_COUNTS "
+                "WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s "
+                "ORDER BY LOGGED_AT DESC LIMIT 1",
+                (schema, tbl),
+            )
+            prev = cur.fetchone()
+            rows_before = prev[0] if prev else 0
+            rows_added = rows_after - rows_before
+
             cur.execute(
                 f"INSERT INTO LAYER_ROW_COUNTS(DAGSTER_RUN_ID, SCHEMA_NAME, TABLE_NAME, "
                 f"ROWS_BEFORE, ROWS_AFTER, ROWS_ADDED, LOGGED_AT) "
-                f"VALUES(%s, %s, %s, 0, %s, %s, {TZ_NOW})",
-                (run_id, schema, tbl, cnt, cnt),
+                f"VALUES(%s, %s, %s, %s, %s, %s, {TZ_NOW})",
+                (run_id, schema, tbl, rows_before, rows_after, rows_added),
             )
-            context.log.info(f"  {schema}.{tbl}: {cnt:,} rows")
+
+            # Log meaningful delta
+            if rows_before == 0 and rows_after > 0:
+                status = "INITIAL LOAD"
+            elif rows_added > 0:
+                status = f"+{rows_added:,} new"
+            elif rows_added == 0:
+                status = "no change"
+            else:
+                status = f"{rows_added:,} removed"
+            context.log.info(f"  {schema}.{tbl}: {rows_before:,} → {rows_after:,} ({status})")
 
         # ── 3. Fetch + log dbt Cloud model results ──
         context.log.info("=" * 55 + "\n  FETCH DBT MODEL RESULTS\n" + "=" * 55)
@@ -88,7 +111,7 @@ def log_dbt_results_to_metrics(context):
 
         conn.commit()
         context.log.info("  All METRICS logged successfully ✓")
-        return Output(None, metadata={"layers_logged": len(ALL_LAYERS)})
+        return Output(None, metadata={"dbt_layers_logged": len(DBT_LAYERS)})
 
     except Exception as e:
         context.log.error(f"  METRICS logging error: {e}")
