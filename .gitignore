@@ -1,8 +1,20 @@
+# RSA keys — NEVER commit
 rsa_key.p8
 rsa_key.pub
+rsa_key_raw.pem
+
+# Local env
 .env
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Dagster local artifacts
 .tmp_dagster_home*/
+
+# dbt artifacts
 target/
 dbt_packages/
+logs/
